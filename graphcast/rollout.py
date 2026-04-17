@@ -21,9 +21,35 @@ import dask.array
 from graphcast import xarray_jax
 from graphcast import xarray_tree
 import jax
+import jax.numpy as jnp
 import numpy as np
 import typing_extensions
 import xarray
+
+
+def _device_put_sharded(data_list, devices, axis_name):
+  """Stack data and put on devices with consistent sharding.
+
+  Creates a mesh with axis_name to ensure JIT cache consistency with pmap.
+
+  Args:
+    data_list: List of data to stack and put on devices.
+    devices: List of devices to put the data on.
+    axis_name: Name of the axis to use for sharding.
+
+  Returns:
+    Data put on devices with consistent sharding.
+  """
+
+  mesh = jax.sharding.Mesh(np.array(devices), (axis_name,))
+  sharding = jax.NamedSharding(mesh, jax.P(axis_name))
+  stack_fn = (
+      jnp.stack
+      if all(isinstance(x, jax.Array) for x in data_list)
+      else np.stack
+  )
+  stacked = stack_fn(data_list, axis=0)
+  return jax.device_put(stacked, sharding)
 
 
 class PredictorFn(typing_extensions.Protocol):
@@ -53,9 +79,7 @@ def _replicate_dataset(
       data = len(devices) * [variable.data]
       if replicate_to_device:
         assert devices is not None
-        # TODO(pricei): Refactor code to use "device_put_replicated" instead of
-        # device_put_sharded.
-        data = jax.device_put_sharded(data, devices)
+        data = _device_put_sharded(data, devices, replica_dim)
       else:
         data = np.stack(data, axis=0)
       return xarray_jax.Variable(
@@ -124,7 +148,8 @@ def chunked_prediction_generator_multiple_runs(
       sample_idx = slice(i, i + len(pmap_devices))
       logging.info("Samples %s out of %s", sample_idx, num_samples)
       logging.flush()
-      sample_group_rngs = rngs[sample_idx]
+      sample_group_rngs = _device_put_sharded(
+          rngs[sample_idx], pmap_devices, "sample")
 
       if "sample" not in inputs.dims:
         sample_inputs = inputs
@@ -167,6 +192,7 @@ def chunked_prediction_generator_multiple_runs(
           targets_template=targets_template,
           forcings=sample_forcings,
           pmap_devices=pmap_devices,
+          replica_axis="sample",
           **chunked_prediction_kwargs,
       ):
         prediction_chunk.coords["sample"] = np.arange(
@@ -237,7 +263,8 @@ def chunked_prediction(
       targets_template=targets_template,
       forcings=forcings,
       num_steps_per_chunk=num_steps_per_chunk,
-      verbose=verbose):
+      verbose=verbose,
+  ):
     chunks_list.append(jax.device_get(prediction_chunk))
   return xarray.concat(chunks_list, dim="time")
 
@@ -250,7 +277,8 @@ def chunked_prediction_generator(
     forcings: xarray.Dataset,
     num_steps_per_chunk: int = 1,
     verbose: bool = False,
-    pmap_devices: Optional[Sequence[jax.Device]] = None
+    pmap_devices: Sequence[jax.Device] | None = None,
+    replica_axis: str | None = None,
 ) -> Iterator[xarray.Dataset]:
   """Outputs a long trajectory by yielding chunked predictions.
 
@@ -267,6 +295,7 @@ def chunked_prediction_generator(
     verbose: Whether to log the current chunk being predicted.
     pmap_devices: List of devices over which predictor_fn is pmapped, or None if
       it is not pmapped.
+    replica_axis: Dimension name to use for the replicas.
 
   Yields:
     The predictions for each chunked step of the chunked rollout, such as
@@ -274,6 +303,9 @@ def chunked_prediction_generator(
     template in structure.
 
   """
+
+  if pmap_devices is not None and replica_axis is None:
+    raise ValueError("Must provide replica_axis when pmap_devices is provided.")
 
   # Create copies to avoid mutating inputs.
   inputs = xarray.Dataset(inputs)
@@ -319,7 +351,9 @@ def chunked_prediction_generator(
     return rng1, rng2
 
   if pmap_devices is not None:
-    split_rng_fn = jax.pmap(split_rng_fn, devices=pmap_devices)
+    split_rng_fn = jax.pmap(
+        split_rng_fn, devices=pmap_devices, axis_name=replica_axis
+    )
 
   for chunk_index in range(num_chunks):
     if verbose:

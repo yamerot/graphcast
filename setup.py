@@ -21,7 +21,7 @@ description = (
 
 setup(
     name="graphcast",
-    version="0.2.0.dev",
+    version="0.2",
     description=description,
     long_description=description,
     author="DeepMind",

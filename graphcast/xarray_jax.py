@@ -554,11 +554,13 @@ def apply_ufunc(func, *args, require_jax=False, **apply_ufunc_kwargs):
   return xarray.apply_ufunc(wrapped_func, *args, **apply_ufunc_kwargs)
 
 
-def pmap(fn: Callable[..., Any],
-         dim: str,
-         axis_name: Optional[str] = None,
-         devices: ... = None,
-         backend: ... = None) -> Callable[..., Any]:
+def pmap(
+    fn: Callable[..., Any],
+    dim: str,
+    axis_name: Optional[str] = None,
+    devices=None,
+    backend=None,
+) -> Callable[..., Any]:
   """Wraps a subset of jax.pmap functionality to handle xarray input/output.
 
   Constraints:
@@ -585,6 +587,32 @@ def pmap(fn: Callable[..., Any],
     A pmap'd version of `fn`, which takes and returns Dataset/DataArray with an
     extra leading dimension `dim` relative to what the original `fn` sees.
   """
+  return _vmap_or_pmap(
+      fn, dim, axis_name, devices, backend, is_vmap=False,
+  )
+
+
+def vmap(
+    fn: Callable[..., Any],
+    dim: str,
+    axis_name: Optional[str] = None,
+) -> Callable[..., Any]:
+  """Similar to pmap, but for vmap."""
+  return _vmap_or_pmap(
+      fn, dim, axis_name, None, None, is_vmap=True,
+  )
+
+
+def _vmap_or_pmap(
+    fn: Callable[..., Any],
+    dim: str,
+    axis_name: Optional[str] = None,
+    devices=None,
+    backend=None,
+    is_vmap: bool = False,
+) -> Callable[..., Any]:
+  """See pmap documentations."""
+
   input_treedef = None
   output_treedef = None
 
@@ -606,13 +634,22 @@ def pmap(fn: Callable[..., Any],
     flat_result, output_treedef = jax.tree_util.tree_flatten(result)
     return flat_result
 
-  pmapped_fn = jax.pmap(
-      fn_passed_to_pmap,
-      axis_name=axis_name or dim,
-      in_axes=0,
-      out_axes=0,
-      devices=devices,
-      backend=backend)
+  if is_vmap:
+    assert devices is None
+    assert backend is None
+    pmapped_fn = jax.vmap(
+        fn_passed_to_pmap,
+        axis_name=axis_name or dim,
+        in_axes=0,
+        out_axes=0)
+  else:
+    pmapped_fn = jax.pmap(
+        fn_passed_to_pmap,
+        axis_name=axis_name or dim,
+        in_axes=0,
+        out_axes=0,
+        devices=devices,
+        backend=backend)
 
   def result_fn(*args):
     nonlocal input_treedef
@@ -625,6 +662,7 @@ def pmap(fn: Callable[..., Any],
       return jax.tree_util.tree_unflatten(output_treedef, flat_result)
 
   return result_fn
+
 
 _PyTree = TypeVar('_PyTree')
 

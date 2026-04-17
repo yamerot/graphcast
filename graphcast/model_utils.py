@@ -378,8 +378,10 @@ def get_rotation_matrices_to_local_coordinates(
                         axis=1)).as_matrix()
   elif rotate_longitude:
     # Just like the previous case, but applying only the azimuthal rotation,
-    # leaving the latitude unchanged.
-    return transform_.Rotation.from_euler("z", azimuthal_rotation).as_matrix()
+    # leaving the latitude unchanged. Even though it is a single rotation, we
+    # need a "sequence" axis of size 1 (hence the expand_dims).
+    return transform_.Rotation.from_euler(
+        "z", np_.expand_dims(azimuthal_rotation, axis=1)).as_matrix()
   elif rotate_latitude:
     # We want to apply the polar rotation only, but we don't know the rotation
     # axis to apply a polar rotation. The simplest way to achieve this is to

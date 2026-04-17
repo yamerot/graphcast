@@ -41,15 +41,16 @@ NoiseLevelEncoder = Callable[[jnp.ndarray], jnp.ndarray]
 class FourierFeaturesMLP(hk.Module):
   """A simple MLP applied to Fourier features of values or their logarithms."""
 
-  def __init__(self,
-               base_period: float,
-               num_frequencies: int,
-               output_sizes: Sequence[int],
-               apply_log_first: bool = False,
-               w_init: ... = None,
-               activation: ... = jax.nn.gelu,
-               **mlp_kwargs
-               ):
+  def __init__(
+      self,
+      base_period: float,
+      num_frequencies: int,
+      output_sizes: Sequence[int],
+      apply_log_first: bool = False,
+      w_init=None,
+      activation=jax.nn.gelu,
+      **mlp_kwargs
+  ):
     """Initializes the module.
 
     Args:
