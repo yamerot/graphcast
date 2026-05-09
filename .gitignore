@@ -1,2 +1,4 @@
 params/
-dataset/
+__pycache__/
+dataset
+output
