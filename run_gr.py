@@ -41,7 +41,18 @@ def load_checkpoint(ckpt_path: str):
     return ckpt.params, state, ckpt.model_config, ckpt.task_config
 
 def load_data(data_paths: list, stats_dir: str):
-    ds = xr.open_mfdataset(data_paths).rename({})
+    ds = xr.open_mfdataset(data_paths).rename({
+        't2m': '2m_temperature', 
+        'msl': 'mean_sea_level_pressure', 
+        'u10': '10m_v_component_of_wind', 
+        'v10': '10m_u_component_of_wind', 
+        't': 'temperature', 
+        'z': 'geopotential', 
+        'u': 'u_component_of_wind', 
+        'v': 'v_component_of_wind', 
+        'w': 'vertical_velocity', 
+        'q': 'specific_humidity'
+    })
 
     diffs = xr.load_dataset(f"{stats_dir}/diffs_stddev_by_level.nc").compute()
     mean = xr.load_dataset(f"{stats_dir}/mean_by_level.nc").compute()
@@ -50,188 +61,82 @@ def load_data(data_paths: list, stats_dir: str):
     return ds, diffs, mean, stddev
 
 def prepare_data_from_hourly(
-    ds: xr.Dataset, input_vars: tuple, target_vars: tuple, forcing_vars: tuple, plevs: tuple, 
+    ds: xr.Dataset, input_vars: tuple, target_vars: tuple, 
     input_duration: str = "12h",
     target_hours: list = [6, 12, 18, 24],
 ):
-    # 1. 检查 datetime 坐标
-    assert 'datetime' in ds.coords, 'datetime not found in dataset'
-    ds = ds.sortby('datetime')
+    def batching(ds: xr.Dataset, window_slice) -> xr.Dataset:
+        """
+        ds: 逐小时连续时间块 [time, ...]
+        window_slice: 需要滑动选取的相对时刻窗口 (eg. [0, 6]) 
+        将 ds 重组为 [batch, time, ...] 结构, 其中 time 维度被替换为相对时刻, 在不同真实时刻上所取的输入被划分为不同 batch, 比如 batch[0] <- [T00, T06], batch[1] <- [T01, T07] ...
+        """
+        moments = []
+        chunksize = len(ds.time.values)
+        batchsize = chunksize - window_slice[-1]
+        for t in window_slice:
+            moment = ds.isel(time=np.arange(t, t + batchsize))\
+                    .rename(time='batch').assign_coords(batch=np.arange(0, batchsize))
+            moments.append(moment)
+        return xr.concat(moments, dim='time').assign_coords(time=np.array(window_slice))
+    
+    # 1. 前置处理: 检查 datetime 坐标, 纬度坐标按升序排列
+    if 'datetime' not in ds.coords:
+        assert 'time' in ds.coords, 'datetime not found'
+        ds = ds.rename_vars(time='datetime').assign_coords(time=ds.time)
+    if ds.lat.values[0] > ds.lat.values[-1]:
+        ds = ds.reindex (lat=list(reversed(ds.lat)))
 
-    # 2. 为原始历史数据添加 TISR 和派生变量（用于输入部分）
+    # 2. 输入数据处理: 添加 TISR 和派生变量, 时间维度重组
     data_utils.add_tisr_var(ds)
     data_utils.add_derived_vars(ds)
-
-    # 3. 重组输入
-    # 原始数据为逐小时连续时间块 [datetime, ...], 重组为 [batch, time, ...] 结构
-    # 其中 time 代表模型输入时刻 (eg. [-6h, 0h]) 而非真实时间
-    # 在不同真实时刻上所取的输入被划分为不同 batch, 
-    # 比如 batch[0] <- [T00, T06], batch[1] <- [T01, T07] ...
     onehour = pd.Timedelta('1h')
-    input_hours = list(range(- pd.Timedelta(input_duration) // onehour + 6, 6, 6))  # [-6, 0]
-    inputs = []
-    chunksize = len(ds.time.values)
-    batchsize = chunksize + input_hours[0]
-    for t in input_hours:
-        shift = t - input_hours[0]
-        moment = ds.isel(datetime=np.arange(shift, shift + batchsize)).drop_vars('datetime').rename(datetime='batch')
-        inputs.append(moment)
-    inputs = xr.concat(inputs, dim='time')
-    input_times = [pd.Timedelta(hours=h) for h in input_hours]
-    inputs = inputs.assign_coords(time=input_times)
+    slice_in = np.arange(0, 6, pd.Timedelta(input_duration) // onehour)  # 12h -> (0, 6)
+    inputs = batching(ds[input_vars], slice_in)
+    input_last_datetime = inputs.datetime.sel(batch=1)
 
-    target_times = [pd.Timedelta(hours=h) for h in target_hours]
-
-    # 提取所有可能的窗口起始索引（保证输入部分完整）
-    time_idx = np.arange(len(ds_step['datetime']))
-    # 最后一个可用的起始索引：len - input_steps + 1? 但 input_steps 窗口包含索引 start...start+input_steps-1
-    start_indices = time_idx[: -input_steps + 1] if input_steps > 1 else time_idx
-
-    batch_inputs, batch_targets, batch_forcings = [], [], []
-
-    # 静态变量（无时间维度）
-    static_vars = [v for v in input_vars
-                   if v in ds_step.data_vars and 'datetime' not in ds_step[v].dims]
-    dyn_input_vars = [v for v in input_vars if v not in static_vars]
-    dyn_target_vars = [v for v in target_vars if v not in static_vars]
-    dyn_forcing_vars = [v for v in forcing_vars if v not in static_vars]
-
-    for start in start_indices:
-        # ---- 构建 inputs ----
-        input_data = ds_step.isel(datetime=slice(start, start + input_steps))
-        ref_time = input_data['datetime'].isel(datetime=input_steps - 1)  # 参考时刻（输入最后一步）
-        # 转为相对时间 (timedelta)
-        input_rel_times = input_data['datetime'] - ref_time
-        input_data = input_data.assign_coords(datetime=input_rel_times)
-        input_data = input_data.rename({'datetime': 'time'})
-
-        # ---- 构建未来的目标时间坐标 ----
-        target_rel_times = np.array(target_timedeltas)  # 已经是相对于 ref_time 的偏移
-        # 构造一个只包含时间、纬度、经度的临时 Dataset，用于计算 TISR 和派生变量
-        target_ds = xr.Dataset(
+    # 3. 从目标时间轴构建 forcing 数据, 计算 TISR 和派生变量
+    target_datetime = xr.concat(
+        [input_last_datetime + pd.Timedelta(hours=h) for h in target_hours], 
+        dim='time')
+    forcings = xr.Dataset(
             coords={
-                'datetime': target_rel_times,   # 实际是 timedelta，但 forceding 函数需要 datetime 坐标
-                'lat': ds_step.coords['lat'],
-                'lon': ds_step.coords['lon'],
+                'time': (target_datetime - target_datetime[0]) // onehour, 
+                'level': ds.level, 
+                'lat': ds.lat, 'lon': ds.lon, 
+                'datetime': target_datetime, 
             }
         )
-        # 注意：add_tisr_var 和 add_derived_vars 需要 datetime 坐标是真正的 datetime64 类型，但这里只是 timedelta？不行！
-        # 我们需要将目标相对时间转换为绝对时间：ref_time + offset
-        # ref_time 是 pandas Timestamp 或 numpy datetime64
-        abs_target_times = ref_time.values + target_rel_times  # 得到绝对时间数组
-        target_ds = target_ds.assign_coords(datetime=abs_target_times)
+    data_utils.add_tisr_var(forcings)
+    data_utils.add_derived_vars(forcings)
+    slice_tg = np.array(target_hours) - target_hours[0]
+    forcings = batching(forcings, slice_tg)
 
-        # 计算目标时刻的 TISR 和派生变量
-        add_tisr_var(target_ds)
-        add_derived_vars(target_ds)
+    # 4. 构建 target 数据, 用 nan 填充
+    surface_shape = (len(forcings.batch), len(forcings.time), len(forcings.lat), len(forcings.lon))
+    upper_shape = (len(forcings.batch), len(forcings.time), len(forcings.level), len(forcings.lat), len(forcings.lon))
 
-        # 从 target_ds 中提取 forcing 变量
-        forcing_data = target_ds[list(set(dyn_forcing_vars) & set(target_ds.data_vars))]
-        # 将时间坐标改为相对时间 (timedelta)，以便与 targets 对齐
-        forcing_data = forcing_data.assign_coords(datetime=target_rel_times)
-        forcing_data = forcing_data.rename({'datetime': 'time'})
+    surface_nan = (('batch', 'time', 'lat', 'lon'), np.full(surface_shape, np.nan))
+    upper_nan = (('batch', 'time', 'level', 'lat', 'lon'), np.full(upper_shape, np.nan))
 
-        # ---- 构建全 NaN 的目标模板 ----
-        target_data = target_ds.copy()
-        # 将目标变量（target_vars）全部设为 NaN，保留维度
-        for var in dyn_target_vars:
-            # 目标变量应该存在于 target_ds 中（因为 add_* 只添加了 forcing 相关），
-            # 但我们的 target_ds 刚开始是空的，只有坐标，需要先添加同名变量并设为 NaN
-            # 所以更简单：先构建一个具有相同时间/空间坐标的 DataArray，全 NaN
-            # 这里用 xr 广播机制：创建一个 NaN 模板
-            pass
-
-        # 推荐方式：直接用 xr 构造全 NaN 的目标，保持与 input 相同的空间维度
-        # 先利用 target_ds 的坐标创建模板，再赋予 NaN
-        target_template = xr.Dataset(
-            {var: (('datetime',) + (('level',) if 'level' in input_data[var].dims else ()) + ('lat', 'lon'),
-                   np.full_like(
-                       input_data[var].isel(time=0).values if 'level' not in input_data[var].dims else
-                       input_data[var].isel(time=0).values, np.nan, dtype=np.float32))
-             for var in dyn_target_vars if var in dyn_input_vars or var in static_vars},
-            coords={
-                'datetime': target_rel_times,
-                'lat': ds_step.coords['lat'],
-                'lon': ds_step.coords['lon'],
-            }
-        )
-        # 如果目标变量有 level 维度，需要加入 level 坐标
-        if 'level' in input_data.dims:
-            target_template.coords['level'] = input_data.coords['level']
-        # 现在将值全部设为 NaN，并扩展时间维度（广播）
-        # 上述 np.full_like 已生成 NaN，但需要每个时间步都复制？我们用 ones_like 然后乘 NaN
-        # 简化：直接用 xr 的 broadcasting
-        target_data = target_template
-        # 其实 target_template 已经是 (datetime, lat, lon) 的多维 NaN 了，但 datetime 只有一个值，我们需要为每个目标时间复制
-        # 所以需要 expand_dims 然后 concat 或 tile。不如用循环：
-        target_list = []
-        for t in target_rel_times:
-            dt = target_template.isel(datetime=0)  # 取第一个模板
-            dt = dt.expand_dims('time')
-            dt['time'] = [t]
-            target_list.append(dt)
-        target_data = xr.concat(target_list, dim='time')
-        # 修正坐标名称
-        target_data = target_data.rename({'time': 'time'})  # 已经叫 time 了，但之前是 datetime，无所谓
-
-        # 但我们还需确保目标变量中没有 NaN 之外的问题。上面生成已经都是 NaN。
-
-        # 现在将时间坐标变为 timedelta（与输入一致）
-        target_data = target_data.assign_coords(time=target_rel_times)
-
-        # 添加静态变量到输入（扩展时间维度）
-        for var in static_vars:
-            if var in ds_step.data_vars:
-                # 静态变量没有时间维度，直接复制到输入中
-                input_data[var] = ds_step[var]
-
-        # 添加 batch 维度
-        input_data = input_data.expand_dims('batch')
-        target_data = target_data.expand_dims('batch')
-        forcing_data = forcing_data.expand_dims('batch')
-
-        batch_inputs.append(input_data)
-        batch_targets.append(target_data)
-        batch_forcings.append(forcing_data)
-
-    # 沿 batch 维度拼接
-    inputs = xr.concat(batch_inputs, dim='batch')
-    targets = xr.concat(batch_targets, dim='batch')
-    forcings = xr.concat(batch_forcings, dim='batch')
-
-    # 按气压层筛选（对 level 维进行选择）
-    if 'level' in inputs.dims:
-        inputs = inputs.sel(level=list(pressure_levels))
-    if 'level' in targets.dims:
-        targets = targets.sel(level=list(pressure_levels))
-    # forcings 通常不含 level 维度，sel 会忽略
-
-    return inputs, targets, forcings
-
-def prepare_inputs_targets_forcings(ds: xr.Dataset, task_config):
-    """根据任务配置提取输入、目标和强迫项（目标仅用于构造模板）"""
-
-    # 计算最大可用预测步数（除去两个输入时次）
-    max_steps = ds.sizes["time"] - 2
-    lead_steps = min(PRED_STEPS, max_steps)
-    target_lead_times = slice("6h", f"{lead_steps*6}h")
-
-    inputs, targets, forcings = data_utils.extract_inputs_targets_forcings(
-        ds,
-        target_lead_times=target_lead_times,
-        input_variables=task_config.input_variables,
-        target_variables=task_config.target_variables,
-        forcing_variables=task_config.forcing_variables,
-        pressure_levels=task_config.pressure_levels,
-        input_duration=task_config.input_duration,
+    targets = xr.Dataset(
+        data_vars={var: surface_nan if 'level' in ds[var].dims else upper_nan 
+         for var in target_vars}, 
+        coords=forcings.coords
     )
 
-    print(f"input dims: {inputs.dims}")
-    print(f"target dims: {targets.dims}")
-    print(f"forcing dims: {forcings.dims}")
+class Loader:
+    def __init__(ds, chunksize, batchsize):
+        pass
 
-    return inputs, targets, forcings
+    def batching(ds, window_slice):
+        pass
 
+    def update(idx):
+        pass
+
+    def claim():
+        pass
 
 def build_inference_fn(model_config, task_config, diffs_stddev_by_level, mean_by_level, stddev_by_level):
     """构建包装好并经过标准化处理的自回归预测函数"""
@@ -254,7 +159,6 @@ def build_inference_fn(model_config, task_config, diffs_stddev_by_level, mean_by
 
     # 将 model_config 和 task_config 绑定到函数
     return functools.partial(run_forward, model_config=model_config, task_config=task_config)
-
 
 def main():
     # 1. 加载模型
