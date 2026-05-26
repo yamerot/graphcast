@@ -2,4 +2,4 @@ params/
 __pycache__/
 dataset
 output
-run.log
+run*.log

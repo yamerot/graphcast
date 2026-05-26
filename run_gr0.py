@@ -29,7 +29,6 @@ STATIC_PATH = '/home/chengzy/dlink/era5_zarr_v3/static.zarr'        # 输入气�
 STATS_DIR = "graphcast/stats/graphcast_stats_"              # 标准化统计量路径前缀
 OUTPUT_PATH = "graphcast/output/try.zarr"    # 预测结果保存路径
 DEVICE = "gpu"                              # 计算设备：可选 "cpu", "gpu", "tpu"
-BATCHSIZE = 1
 
 
 def load_checkpoint(ckpt_path: str):
@@ -60,16 +59,15 @@ def load_data(upper_path, surface_path, static_path, stats_prefix):
         if ds.lat.values[0] > ds.lat.values[-1]:
             ds = ds.reindex(lat=list(reversed(ds.lat)))
         # 气压升序排序
-        if 'lev' in list(ds.coords):
-            ds = ds.rename({'lev': 'level'})
-            if ds.level.values[0] > ds.level.values[-1]:
-                ds = ds.reindex(lev=list(reversed(ds.level)))
+        if 'lev' in list(ds.coords) and ds.lev.values[0] > ds.lev.values[-1]:
+            ds = ds.reindex(lev=list(reversed(ds.lev)))
         # 将变量名替换为长名
         if rename_dict:
             ds = ds.rename(rename_dict)
         return ds
 
     upper_dict = {
+        'lev': 'level', 
         't': 'temperature', 
         'z': 'geopotential', 
         'u': 'u_component_of_wind', 
@@ -103,6 +101,7 @@ class Loader:
                  batchsize: int = 6, 
                  input_duration: str = "12h",
                  target_hours: list = [6, 12, 18, 24]):
+
         
         sel_vars = [var for var in list(ds.data_vars) if var in input_vars]
         ds_sel = ds[sel_vars]
@@ -114,23 +113,16 @@ class Loader:
         self.ds_static = ds_static[sel_vars]
 
         # 1. 取样的相对时刻窗口, 
-        # e.g. input_duration: '12h', batchsize = 2, 计算得到以下值: 
-        # input_hours: (-6, 0) -> input_idx: (0, 6) -> input_batch_idx: (0, 1, 6, 7)
-        # target_hours: (6, 12) -> target_idx: (12, 18) -> target_batch_idx: (12, 13, 18, 19)
+        # e.g. input_duration: '12h' -> input_hours: (-6, 0)
         onehour = pd.Timedelta('1h')
         self.input_hours = np.arange(- pd.Timedelta(input_duration) // onehour, 0, 6) + 6
-        input_idx = self.input_hours - self.input_hours[0]
-        self.input_batch_idx = np.concatenate([np.arange(x, x + batchsize) for x in input_idx])
-        
-        self.target_hours = np.array(target_hours)
-        target_idx = self.target_hours - self.input_hours[0]
-        self.target_batch_idx = np.concatenate([np.arange(x, x + batchsize) for x in target_idx])
-
         self.batchsize = batchsize
+        self.continuous_chunksize = batchsize + 6 * (len(self.input_hours) - 1)
+        self.target_hours = np.array(target_hours)
 
         # 2. 时间连续形式的 forcings 模板
         self.forcings_template = xr.Dataset(
-            coords={'time': self.target_batch_idx, 
+            coords={'time': np.arange(0, batchsize + target_hours[-1] - target_hours[0]), 
                     'level': ds.level, 
                     'lat': ds.lat, 
                     'lon': ds.lon}
@@ -145,7 +137,7 @@ class Loader:
         self.targets_template = xr.Dataset(
             data_vars={var: upper_nan if var in list(ds.data_vars) else surface_nan
             for var in target_vars}, 
-            coords={'time': self.target_hours, 
+            coords={'time': target_hours, 
                     'level': ds.level, 
                     'lat': ds.lat, 
                     'lon': ds.lon}
@@ -154,44 +146,54 @@ class Loader:
         # 4. 数据暂存区
         self.upper_cache = ChunkCache(ds_sel)
         self.surface_cache = ChunkCache(ds_surface_sel)
-        self.full_datetime = ds_sel.datetime.data
 
-    def batching(self, ds: xr.Dataset, hours, batchsize) -> xr.Dataset:
+    def batching(self, ds: xr.Dataset, hours) -> xr.Dataset:
         """
-        ds: 逐小时连续时间块 [time, ...]
+        ds: 逐小时连续时间块 [time, ...] * 注意: time 维度需要从 0 开始
+        hours: 需要滑动选取的相对时刻窗口 (eg. [0, 6], [6, 12, 18] 等) 
         将 ds 重组为 [batch, time, ...] 结构, 其中 time 维度被替换为相对时刻, 在不同真实时刻上所取的输入被划分为不同 batch, 比如 batch[0] <- [T00, T06], batch[1] <- [T01, T07] ...
         """
-        return ds.drop_vars('time')\
-                 .assign_coords(
-                    batch=('time', np.tile(np.arange(0, batchsize), len(hours))), 
-                    moment=('time', np.repeat(np.arange(0, len(hours)), batchsize))
-                 )\
-                 .set_index(time=['batch', 'moment']).unstack('time')\
-                 .rename(moment='time')\
-                 .transpose('batch', 'time' ,'level', 'lat', 'lon')\
-                 .assign_coords(time=hours)
+        moments = []
+        window_slice = hours - hours[0]
+        batchsize = len(ds.time) - window_slice[-1]
+        for t in window_slice:
+            moment = ds.isel(time=np.arange(t, t + batchsize))\
+                    .rename(time='batch').drop_vars('batch')\
+                    .reset_coords('datetime')   # 将 datetime 坐标转为一维变量, 才能进行拼接
+            moments.append(moment)
+        minibatch = xr.concat(moments, dim='time').assign_coords(time=np.array(hours))\
+               .set_coords('datetime')  # 此时 datetime 变为二维坐标
+        return minibatch
 
     def update(self, start):
-        inputs = self.get_chunk(start + self.input_batch_idx)
+        idx_range = np.arange(start, start + self.continuous_chunksize)
+        inputs = self.get_continuous(idx_range)
         add_tisr_var(inputs)
         add_derived_vars(inputs)
-        inputs = self.batching(inputs, self.input_hours, self.batchsize)
+        inputs = self.batching(inputs, self.input_hours)
         inputs.update(self.ds_static)
         
         # forcings 和 targets 的时间信息是一致的
-        targets_datetime = self.full_datetime[start + self.target_batch_idx]
+        # 在输入的基准时间上加上预测时效，得到目标时间 (连续形式), 写入 forcings 模板
+        targets_datetime = np.concatenate(
+            [inputs.datetime.sel(time=0).data + pd.Timedelta(hours=h) for h in self.target_hours]
+        )
         forcings = self.forcings_template.assign_coords(datetime=('time', targets_datetime))
         add_tisr_var(forcings)
         add_derived_vars(forcings)
-        forcings = self.batching(forcings, self.target_hours, self.batchsize)
+        forcings = self.batching(forcings, self.target_hours)
 
         target_batch_datetime = forcings.datetime
         inputs = inputs.drop_vars(['datetime', 'day_progress', 'year_progress'])
         forcings = forcings.drop_vars(['datetime', 'day_progress', 'year_progress'])
 
+        logger.debug(inputs)
+        logger.debug(self.targets_template)
+        logger.debug(forcings)
+
         return target_batch_datetime, inputs, self.targets_template, forcings
 
-    def get_chunk(self, idx) -> xr.Dataset:
+    def get_continuous(self, idx) -> xr.Dataset:
         return xr.merge([self.upper_cache.claim(idx), 
                          self.surface_cache.claim(idx)], compat='no_conflicts')
 
@@ -224,7 +226,7 @@ class ChunkCache:
             return self.cache[0].isel(time=idx)
         else:
             idx1 = idx[idx <= self.current[-1]]
-            idx2 = idx[idx > self.current[-1]] - 12
+            idx2 = idx[idx > self.current[-1]]
             return xr.concat([self.cache[0].isel(time=idx1), 
                               self.cache[1].isel(time=idx2)], dim='time')
         
@@ -299,7 +301,7 @@ def main():
 
     # 2. 加载数据
     logger.info('loading data...')
-    batchsize = BATCHSIZE
+    batchsize = 1
     ds, ds_surface, ds_static, diffs_stddev_by_level, mean_by_level, stddev_by_level = load_data(UPPER_PATH, SURFACE_PATH, STATIC_PATH, STATS_DIR)
     loader = Loader(ds, ds_surface, ds_static, 
                     task_config.input_variables, task_config.target_variables, 
