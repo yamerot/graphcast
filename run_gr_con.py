@@ -5,7 +5,7 @@ import os
 import sys
 import logging
 from zarr.codecs import BloscCodec
-from dask.distributed import Client, LocalCluster
+import concurrent
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -22,9 +22,8 @@ from graphcast import normalization
 from graphcast import rollout
 from graphcast.data_utils import add_tisr_var, add_derived_vars
 
-
-
-# nohup python run_gr.py &
+# nohup python run_gr_con.py &
+# CUDA_LAUNCH_BLOCKING=1 JAX_DISABLE_CUDA_GRAPH=1 nohup python run_gr_con.py &
 
 # 模型权重文件路径（.npz）
 CHECKPOINT_PATH = 'graphcast/params/graphcast_params_GraphCast_operational - ERA5-HRES 1979-2021 - resolution 0.25 - pressure levels 13 - mesh 2to6 - precipitation output only.npz'
@@ -32,7 +31,7 @@ UPPER_PATH = '/home/chengzy/dlink/era5_zarr_v3/plev.zarr'
 SURFACE_PATH = '/home/chengzy/dlink/era5_zarr_v3/slev.zarr'
 STATIC_PATH = '/home/chengzy/dlink/era5_zarr_v3/static.zarr'        # 输入气象数据文件路径
 STATS_DIR = "graphcast/stats/graphcast_stats_"              # 标准化统计量路径前缀
-OUTPUT_DIR = "graphcast/output/graphcast_op_"    # 预测结果保存路径前缀
+OUTPUT_DIR = "graphcast/output/hhhgraphcast_op_"    # 预测结果保存路径前缀
 DEVICE = "gpu"                              # 计算设备：可选 "cpu", "gpu", "tpu"
 BATCHSIZE = 1
 
@@ -93,7 +92,8 @@ class Loader:
                  target_vars: list | tuple, 
                  batchsize: int = 6, 
                  input_duration: str = "12h",
-                 target_hours: list = [6, 12, 18, 24]):
+                 target_hours: list = [6, 12, 18, 24], 
+                 start_idx: int = 0):
         
         sel_vars = [var for var in list(ds.data_vars) if var in input_vars]
         ds_sel = ds[sel_vars]
@@ -143,8 +143,8 @@ class Loader:
         )
         
         # 4. 数据暂存区
-        self.upper_cache = ChunkCache(ds_sel)
-        self.surface_cache = ChunkCache(ds_surface_sel)
+        self.upper_cache = ChunkCache(ds_sel, start_idx)
+        self.surface_cache = ChunkCache(ds_surface_sel, start_idx)
         self.full_datetime = ds_sel.datetime.data
 
     def batching(self, ds: xr.Dataset, hours, batchsize) -> xr.Dataset:
@@ -170,7 +170,7 @@ class Loader:
         inputs.update(self.ds_static)
         
         # forcings 和 targets 的时间信息是一致的
-        targets_datetime = self.full_datetime[start + self.target_batch_idx]
+        targets_datetime = self.full_datetime[start] + self.target_batch_idx.astype('timedelta64[h]')
         forcings = self.forcings_template.assign_coords(datetime=('time', targets_datetime))
         add_tisr_var(forcings)
         add_derived_vars(forcings)
@@ -192,26 +192,36 @@ class ChunkCache:
     为了节省读取开销, 建立一个暂存区管理数据, 防止重复从硬盘载入
     暂存区一次只在内存存储两个块
     """
-    def __init__(self, ds: xr.Dataset):
+    def __init__(self, ds: xr.Dataset, start_idx):
         assert 'time' in list(ds.coords), 'time must be in the dataset\'s coords'
-
+        
         self.ds = ds
         self.chunksize = ds[list(ds.data_vars)[0]].encoding['chunks'][0]
+        idxes = np.arange(0, ds.sizes['time'])
+        self.idx_chunks = [idxes[i:i + self.chunksize] for i in range(0, len(idxes), self.chunksize)]
 
-        self.current = np.arange(0, 0 + self.chunksize)
-        self.cache = [ds.isel(time=self.current).compute(), 
-                      ds.isel(time=self.current + self.chunksize).compute()]
+        self.current_chunk = start_idx // self.chunksize
+        self.cache = []
+        self.claim_chunk(self.current_chunk) 
+        self.claim_chunk(self.current_chunk + 1)
+
+    def claim_chunk(self, chunk_idx):
+        if len(self.cache) >= 2:
+            self.cache.pop(0)
+        if chunk_idx < len(self.idx_chunks):
+            self.cache.append(self.ds.isel(time=self.idx_chunks[chunk_idx]).compute())
+        else:
+            logger.debug('No chunks to claim further')
 
     def claim(self, abs_idx):
-        idx= abs_idx - self.current[0]
+        idx= abs_idx - self.idx_chunks[self.current_chunk][0]
         assert idx[0] >= 0, 'no backward-loading'
         assert idx[0] < 2 * self.chunksize, 'no jumping over chunks'
         assert idx[-1] - idx[0] < self.chunksize, 'the range to claim is too long'
         if idx[0] >= self.chunksize:
-            self.cache.pop(0)
             logger.debug('moving to the next chunk')
-            self.current += self.chunksize
-            self.cache.append(self.ds.isel(time=self.current + self.chunksize).compute())
+            self.current_chunk += 1
+            self.claim_chunk(self.current_chunk + 1)
             idx -= self.chunksize
         if idx[-1] < self.chunksize:
             return self.cache[0].isel(time=idx)
@@ -260,52 +270,128 @@ def get_data(queue: Queue, all_idx_range, datelist, loader: Loader):
     logger.info('all data claimed')
     queue.put((None, None, None))
 
+def write_to_zarr(ds_to_write: xr.Dataset, save_path, chunks: tuple):
+    """
+    独立线程 Worker: 负责将已经攒满一个完整 Chunk 的 Dataset 写入硬盘。
+    """
+    # 2. 线程安全地执行写入
+    if os.path.exists(save_path):
+        # 此时追加的数据大小正好等于 Chunk 大小（或其倍数），Zarr 会直接生成新文件块，杜绝 RMW
+        ds_to_write.to_zarr(save_path, mode='a', append_dim='time')
+    else:
+        compressor = BloscCodec(cname='zstd', clevel=5, shuffle='shuffle')
+        encoding = {
+            **{var: {
+                'compressors': [compressor],
+                'dtype': 'float32', 
+                'chunks': chunks
+            } for var in ds_to_write.data_vars}, 
+            **{'time': {
+                'units': 'hours since 1970-01-01T00:00:00',
+                'dtype': 'int64',
+                '_FillValue': None,
+            }}
+        }
+        ds_to_write.to_zarr(save_path, mode='w', zarr_format=3, encoding=encoding)
+
 def save_data(queue: Queue, path_prefix, upper_chunks, surface_chunks, rename_dict):
-    """保存预测结果, 不同时效保存到不同文件"""
-    while True:
-        ds: xr.Dataset = queue.get()
-        if ds is None: 
-            logger.info('all outcomes saved')
-            break
-        # 纬度降序排序
-        if ds.lat.values[0] < ds.lat.values[-1]:
-            ds = ds.reindex(lat=list(reversed(ds.lat)))
-        # 气压降序排序
-        if 'level' in list(ds.coords):
-            ds = ds.rename({'level': 'lev'})
-            if ds.lev.values[0] < ds.lev.values[-1]:
-                ds = ds.reindex(lev=list(reversed(ds.level)))
-        # 将变量名替换为长名
-        if rename_dict:
-            ds = ds.rename(rename_dict)
-        for lead in ds['time'].data:
-            ds_lead = ds.sel(time=lead, drop=True)
-            ds_lead = ds_lead.rename({'batch': 'time'}).assign_coords(time=ds_lead.datetime.data).drop_vars('datetime')
-            save_path = f'{path_prefix}{lead}.zarr'
-            if os.path.exists(save_path):
-                ds_lead.to_zarr(save_path, mode='a', append_dim='time')
-            else:
-                compressor = BloscCodec(cname='zstd', clevel=5, shuffle='shuffle')
-                encoding = {
-                    **{var: {
-                        'compressors': [compressor],
-                        'dtype': 'float32', 
-                        'chunks': upper_chunks if 'level' in ds_lead[var].dims else surface_chunks
-                    } for var in ds_lead.data_vars}, 
-                    **{'time': {
-                        'units': f'hours since 1970-01-01T00:00:00',
-                        'dtype': 'int64',
-                        '_FillValue': None,
-                    }}
-                }
-                ds_lead.to_zarr(save_path, mode='w', zarr_format=3, encoding=encoding)
+    """
+    保存线程：内存攒够完整 Chunk 后，分路径、多线程并行异步写入。
+    """
+    # 初始化高空和地面的内存缓冲区 (Key 为各个预报时效 lead)
+    upper_buffers = {}   
+    surface_buffers = {} 
+
+    # 提取期望的 Chunk 长度阈值（高空为 12，地面为 120）
+    upper_target_len = upper_chunks[0]     
+    surface_target_len = surface_chunks[0] 
+
+    # 创建独立线程池，专门负责后台的磁盘 I/O 写入，不阻塞主预测循环
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2 * len(save_hours)) as executor:
+        futures = []
+        
+        while True:
+            ds: xr.Dataset = queue.get()
+            if ds is None: 
+                break # 收到结束信号，跳出循环进入 Flush 阶段
+            
+            # 1. 统一的公共前处理（每个 Batch 仅执行一次）
+            if ds.lat.values[0] < ds.lat.values[-1]:
+                ds = ds.reindex(lat=list(reversed(ds.lat)))
+            if 'level' in list(ds.coords):
+                ds = ds.rename({'level': 'lev'})
+                if ds.lev.values[0] < ds.lev.values[-1]:
+                    ds = ds.reindex(lev=list(reversed(ds.level)))
+            if rename_dict:
+                ds = ds.rename(rename_dict)
+
+            # 2. 按预报时效（lead）拆分数据并分类塞入缓冲区
+            for lead in ds['time'].data:
+                ds_lead = ds.sel(time=lead, drop=True)
+                ds_lead = ds_lead.rename({'batch': 'time'}).assign_coords(time=ds_lead.datetime.data).drop_vars('datetime')
+                
+                # 核心步骤：通过检查是否包含层维 'lev'，将高空变量与地面变量剥离
+                upper_vars = [v for v in ds_lead.data_vars if 'lev' in ds_lead[v].dims]
+                surface_vars = [v for v in ds_lead.data_vars if 'lev' not in ds_lead[v].dims]
+                
+                # 初始化特定时效的缓存列表
+                if lead not in upper_buffers: upper_buffers[lead] = []
+                if lead not in surface_buffers: surface_buffers[lead] = []
+
+                # --- 处理高空数据 ---
+                if upper_vars:
+                    upper_buffers[lead].append(ds_lead[upper_vars])
+                    # 检查是否攒够一个 chunk
+                    if len(upper_buffers[lead]) == upper_target_len:
+                        ds_write = xr.concat(upper_buffers[lead], dim='time').sortby('time')
+                        save_path = f'{path_prefix}plev_{lead}.zarr'
+                        
+                        # 提交给线程池异步写入
+                        futures.append(executor.submit(write_to_zarr, ds_write, save_path, upper_chunks))
+                        upper_buffers[lead] = [] # 清空该时效的高空缓存
+                        logger.info(f'one chunk saved to {save_path}')
+
+                # --- 处理地面数据 ---
+                if surface_vars:
+                    surface_buffers[lead].append(ds_lead[surface_vars])
+                    # 检查是否攒够一个 chunk
+                    if len(surface_buffers[lead]) == surface_target_len:
+                        ds_write = xr.concat(surface_buffers[lead], dim='time').sortby('time')
+                        save_path = f'{path_prefix}slev_{lead}.zarr'
+                        
+                        # 提交给线程池异步写入
+                        futures.append(executor.submit(write_to_zarr, ds_write, save_path, surface_chunks))
+                        surface_buffers[lead] = [] # 清空该时效的地面缓存
+                        logger.info(f'one chunk saved to {save_path}')
+
+        # 3. Flush 阶段：当所有预测迭代结束，把缓冲区里“未凑满一整块”的残余数据强制刷入硬盘
+        for lead, datasets in upper_buffers.items():
+            if datasets:
+                ds_write = xr.concat(datasets, dim='time').sortby('time')
+                save_path = f'{path_prefix}plev_{lead}.zarr'
+                
+                futures.append(executor.submit(write_to_zarr, ds_write, save_path, upper_chunks))
+                logger.warning(f'upper outcomes that do not fill a chunk saved to {save_path}')
+        
+        for lead, datasets in surface_buffers.items():
+            if datasets:
+                ds_write = xr.concat(datasets, dim='time').sortby('time')
+                save_path = f'{path_prefix}slev_{lead}.zarr'
+
+                futures.append(executor.submit(write_to_zarr, ds_write, save_path, surface_chunks))
+                logger.warning(f'surface outcomes that do not fill a chunk saved to {save_path}')
+
+        # 阻塞等待线程池中最后一批数据彻底落盘，确保进程安全退出
+        concurrent.futures.wait(futures)
+        
+    logger.info('all outcomes saved')
 
 def setup_logging(level=logging.INFO):
     logger = logging.getLogger('graphcast')
     logger.setLevel(level)
 
     # 文件处理器
-    file_handler = logging.FileHandler('./run.log', mode='w')
+    file_handler = logging.FileHandler('./run_gr_con.log', mode='w')
     file_handler.setLevel(level)
 
     # 格式器：包含时间、级别、消息
@@ -327,7 +413,8 @@ def main():
     ds, ds_surface, ds_static, diffs_stddev_by_level, mean_by_level, stddev_by_level = load_data(UPPER_PATH, SURFACE_PATH, STATIC_PATH, STATS_DIR)
     loader = Loader(ds, ds_surface, ds_static, 
                     task_config.input_variables, task_config.target_variables, 
-                    batchsize, '12h', [6, 12, 18, 24])
+                    batchsize, '12h', save_hours, 
+                    start_idx=start)
     
     # 3. 构建推理函数
     logger.info("building inference functions...")
@@ -338,10 +425,10 @@ def main():
     logger.info('initializing I/O threads')
 
     datelist = ds.datetime.data.astype('datetime64[h]')
-    start = 0
-    end = 2 # 暂时测试
-    # end = len(datelist) + loader.input_hours[0]
+    end = len(datelist) + loader.input_hours[0]
     all_idx_range = np.arange(start, end, batchsize)
+
+    logger.info(f'prediction inputs range: {datelist[start]} ~ {datelist[end - 1]}')
 
     queue_in = Queue(maxsize=1)
     load_thread = threading.Thread(target=get_data, args=(queue_in, all_idx_range, datelist, loader), daemon=True)
@@ -349,13 +436,10 @@ def main():
     queue_out = Queue(maxsize=1)
     save_thread = threading.Thread(target=save_data, args=(queue_out, OUTPUT_DIR, upper_chunks, surface_chunks, rev_dict))
     save_thread.start()
-
     # 4. 执行预测
     while True:
         inputs, targets, forcings = queue_in.get()
         if inputs is None:
-            logger.info('all predictions done')
-            queue_out.put(None)
             break
         predictions = rollout.chunked_prediction(
             run_forward_jitted,
@@ -365,11 +449,17 @@ def main():
             forcings=forcings,
         )
         queue_out.put(predictions)
-        
+
+    logger.info('all predictions done')
+    queue_out.put(None)
     save_thread.join()
 
 if __name__ == "__main__":
     os.chdir('/home/chengzy/graphcast')
+
+    save_hours =  [6, 12, 18, 24]
+
+    start = 34920
 
     # 日志设置
     logger = setup_logging(logging.DEBUG)
@@ -401,17 +491,5 @@ if __name__ == "__main__":
         value: key for key, value in {**upper_dict, **surface_dict}.items()
     }
 
-    # 集群配置
-    cluster = LocalCluster(
-        n_workers=4,
-        threads_per_worker=2, 
-        memory_limit='4GB',
-        dashboard_address=':8787'
-    )
-    client = Client(cluster)
-    logger.info(f"Dashboard: {client.dashboard_link}")
-
     main()
 
-    client.close()
-    cluster.close()
